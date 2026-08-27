@@ -1,0 +1,88 @@
+name: Build & Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build Release APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK platform 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android/gradle/libs.versions.toml') }}-v2
+          restore-keys: gradle-
+
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew
+
+      - name: Build release APK
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon --no-configuration-cache --stacktrace
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ""
+          OPENAI_MODEL: ""
+
+      - name: Locate APK
+        id: apk
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename $APK)" >> "$GITHUB_OUTPUT"
+
+      - name: Rename APK to versioned filename
+        run: |
+          TAG="${{ github.ref_name }}"
+          mv "${{ steps.apk.outputs.path }}" "meta-lens-ai-${TAG}.apk"
+          echo "APK_FILE=meta-lens-ai-${TAG}.apk" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Meta Lens AI ${{ github.ref_name }}"
+          body: |
+            ## What's changed in ${{ github.ref_name }}
+
+            ### 🐛 Bug Fixes
+            - **Fixed crash in Live Vision AI** — The stream screen was spawning a new coroutine for every video frame (24fps), exhausting memory on mid-range Android phones. Replaced with a producer/consumer pattern using a conflated channel so stale frames are dropped and only one decode happens at a time.
+            - **Fixed missing CAMERA permission** — Added `android.permission.CAMERA` to the manifest; some Android devices enforce this even for glasses-streamed video via the Meta DAT SDK, causing a `SecurityException` crash.
+            - **Fixed `ByteArrayOutputStream` misuse** — JPEG bytes are now correctly captured before the stream is closed during bitmap decoding.
+
+            ### ⚙️ Build
+            - Upgraded Kotlin to 2.1.20 and AGP to 8.7.3
+            - Updated Gradle wrapper to 8.11.1
+
+            ---
+            > ⚠️ This is an unsigned debug-style release APK. Enable *Install unknown apps* in your Android settings to sideload.
+          files: ${{ env.APK_FILE }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

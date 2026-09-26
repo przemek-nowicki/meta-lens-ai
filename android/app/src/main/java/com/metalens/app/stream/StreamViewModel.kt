@@ -23,6 +23,7 @@ import java.io.ByteArrayOutputStream
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -44,7 +45,12 @@ class StreamViewModel(
     private val _uiState = MutableStateFlow(StreamUiState())
     val uiState: StateFlow<StreamUiState> = _uiState.asStateFlow()
 
+    // CONFLATED channel: if the decoder is busy, we drop intermediate frames instead of
+    // building an unbounded queue that exhausts memory.
+    private val frameChannel = Channel<VideoFrame>(Channel.CONFLATED)
+
     private var videoJob: Job? = null
+    private var frameDecodeJob: Job? = null
     private var stateJob: Job? = null
     private var lastSessionState: StreamSessionState? = null
 
@@ -66,11 +72,17 @@ class StreamViewModel(
                 return
             }
 
+        // Producer: collect raw frames and send to the conflated channel (drops stale frames).
         videoJob =
             viewModelScope.launch {
                 try {
                     Log.d(TAG, "Collecting videoStream...")
-                    session.videoStream.collect { frame -> handleVideoFrame(frame) }
+                    session.videoStream.collect { frame ->
+                        if (_uiState.value.frameCount == 0L) {
+                            Log.d(TAG, "First video frame received: ${frame.width}x${frame.height}")
+                        }
+                        frameChannel.trySend(frame) // drops stale frame if decoder is still busy
+                    }
                     Log.d(TAG, "videoStream completed")
                 } catch (t: Throwable) {
                     if (t is CancellationException) {
@@ -83,6 +95,21 @@ class StreamViewModel(
                             recentError = t.message ?: "Video stream collector failed",
                         )
                     }
+                }
+            }
+
+        // Consumer: single coroutine decodes one frame at a time, preventing OOM.
+        frameDecodeJob =
+            viewModelScope.launch(Dispatchers.Default) {
+                try {
+                    for (frame in frameChannel) {
+                        val bitmap = runCatching { decodeToBitmap(frame) }.getOrNull()
+                        _uiState.update { it.copy(videoFrame = bitmap, frameCount = it.frameCount + 1) }
+                    }
+                } catch (t: Throwable) {
+                    if (t is CancellationException) return@launch
+                    Log.e(TAG, "frameDecodeJob failed", t)
+                    _uiState.update { it.copy(recentError = t.message ?: "Frame decoder failed") }
                 }
             }
 
@@ -113,6 +140,8 @@ class StreamViewModel(
         Log.d(TAG, "stopStream()")
         videoJob?.cancel()
         videoJob = null
+        frameDecodeJob?.cancel()
+        frameDecodeJob = null
         stateJob?.cancel()
         stateJob = null
         streamSession?.close()
@@ -120,23 +149,6 @@ class StreamViewModel(
         _uiState.update { StreamUiState() }
     }
 
-    private fun handleVideoFrame(videoFrame: VideoFrame) {
-        try {
-            if (_uiState.value.frameCount == 0L) {
-                Log.d(TAG, "First video frame received: ${videoFrame.width}x${videoFrame.height}")
-            }
-            viewModelScope.launch {
-                val bitmap =
-                    withContext(Dispatchers.Default) {
-                        decodeToBitmap(videoFrame)
-                    }
-                _uiState.update { it.copy(videoFrame = bitmap, frameCount = it.frameCount + 1) }
-            }
-        } catch (t: Throwable) {
-            Log.e(TAG, "handleVideoFrame failed", t)
-            _uiState.update { it.copy(recentError = t.message ?: "Failed to decode video frame") }
-        }
-    }
 
     private fun decodeToBitmap(videoFrame: VideoFrame): android.graphics.Bitmap? {
         val buffer = videoFrame.buffer
@@ -149,13 +161,11 @@ class StreamViewModel(
 
         val nv21 = convertI420toNV21(byteArray, videoFrame.width, videoFrame.height)
         val image = YuvImage(nv21, ImageFormat.NV21, videoFrame.width, videoFrame.height, null)
-        val out =
-            ByteArrayOutputStream().use { stream ->
-                image.compressToJpeg(Rect(0, 0, videoFrame.width, videoFrame.height), 50, stream)
-                stream.toByteArray()
-            }
+        val out = ByteArrayOutputStream()
+        image.compressToJpeg(Rect(0, 0, videoFrame.width, videoFrame.height), 50, out)
+        val jpegBytes = out.toByteArray()
 
-        return BitmapFactory.decodeByteArray(out, 0, out.size)
+        return BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
     }
 
     // Convert I420 (YYYYYYYY:UUVV) to NV21 (YYYYYYYY:VUVU)

@@ -46,19 +46,38 @@ class AudioIoController(
     private var audioTrack: AudioTrack? = null
 
     suspend fun startRoutingToBluetoothSco() {
+        if (previousMode == null) {
+            previousMode = audioManager.mode
+        }
+        
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+
+        // Modern API 31+ routing
+        val devices = audioManager.availableCommunicationDevices
+        val bluetoothDevice = devices.firstOrNull {
+            it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            it.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET ||
+            it.type == android.media.AudioDeviceInfo.TYPE_BLE_SPEAKER ||
+            it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+        }
+
+        if (bluetoothDevice != null) {
+            val success = audioManager.setCommunicationDevice(bluetoothDevice)
+            if (success) {
+                delay(500) // Small delay to let device switch complete
+                return
+            }
+        }
+
+        // Fallback to older SCO routing
         if (!audioManager.isBluetoothScoAvailableOffCall) {
             throw IllegalStateException("Bluetooth SCO not available on this device")
         }
 
-        if (previousMode == null) {
-            previousMode = audioManager.mode
-        }
         if (previousScoOn == null) {
             @Suppress("DEPRECATION")
             previousScoOn = audioManager.isBluetoothScoOn
         }
-
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
 
         // Starting SCO can be flaky across devices; try a few times with a bounded wait.
         val maxAttempts = 3
@@ -181,6 +200,18 @@ class AudioIoController(
                 .setBufferSizeInBytes(bufferSize)
                 .build()
 
+        // Try to route directly to Bluetooth
+        val devices = audioManager.availableCommunicationDevices
+        val bluetoothDevice = devices.firstOrNull {
+            it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            it.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET ||
+            it.type == android.media.AudioDeviceInfo.TYPE_BLE_SPEAKER ||
+            it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+        }
+        if (bluetoothDevice != null) {
+            track.setPreferredDevice(bluetoothDevice)
+        }
+
         track.play()
         audioTrack = track
     }
@@ -256,6 +287,18 @@ class AudioIoController(
                 .setBufferSizeInBytes(bufferSize)
                 .build()
 
+        // Try to route directly to Bluetooth
+        val devices = audioManager.availableCommunicationDevices
+        val bluetoothDevice = devices.firstOrNull {
+            it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            it.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET ||
+            it.type == android.media.AudioDeviceInfo.TYPE_BLE_SPEAKER ||
+            it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+        }
+        if (bluetoothDevice != null) {
+            record.setPreferredDevice(bluetoothDevice)
+        }
+
         record.startRecording()
         return record
     }
@@ -293,6 +336,7 @@ class AudioIoController(
     }
 
     private fun stopSco() {
+        audioManager.clearCommunicationDevice()
         try {
             @Suppress("DEPRECATION")
             audioManager.stopBluetoothSco()
